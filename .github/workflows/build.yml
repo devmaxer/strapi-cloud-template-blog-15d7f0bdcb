@@ -1,0 +1,374 @@
+name: Build
+run-name: "Build all platforms #${{ github.run_number }}"
+
+on:
+  # GitHub delays scheduled events by hours, so the nightly build is triggered
+  # at 06:00 Kyiv by an external repository_dispatch; these slots are fallbacks.
+  # The plan job builds only the first nightly (schedule or repository_dispatch)
+  # run of each Kyiv day.
+  schedule:
+    - cron: '17 5 * * *'
+      timezone: Europe/Kyiv
+    - cron: '47 9 * * *'
+      timezone: Europe/Kyiv
+    - cron: '17 14 * * *'
+      timezone: Europe/Kyiv
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref
+        required: true
+        type: string
+        default: master
+      target:
+        description: Build target
+        required: true
+        type: choice
+        default: all
+        options: [all, android-apk, ios-app, mac-dmg, windows-exe, linux-appimage, npm-packages]
+      arch:
+        description: Architecture (mac-dmg only; 'all' builds both)
+        required: true
+        type: choice
+        default: all
+        options: [all, arm64, x64]
+  repository_dispatch:
+    types: [build]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # Public repositories lose scheduled workflows after 60 days without
+  # repository activity; re-enabling through the API resets that timer.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Keep schedule enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
+
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - id: plan
+        name: Plan
+        shell: bash
+        env:
+          TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'all' }}
+          ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.arch || 'all' }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const NIGHTLY = ['schedule', 'repository_dispatch'];
+          const output = (line) => fs.appendFileSync(process.env.GITHUB_OUTPUT, `${line}\n`);
+          const firstNightlyRunToday = async () => {
+            const kyivDay = (value) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Kyiv' }).format(new Date(value));
+            const currentId = Number(process.env.GITHUB_RUN_ID);
+            const response = await fetch(
+              `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/actions/workflows/build.yml/runs?per_page=30`,
+              { headers: { authorization: `Bearer ${process.env.GH_TOKEN}`, accept: 'application/vnd.github+json' } },
+            );
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const runs = (await response.json()).workflow_runs.filter((run) => NIGHTLY.includes(run.event));
+            const today = kyivDay(runs.find((run) => run.id === currentId)?.created_at ?? Date.now());
+            const earlier = runs.find((run) => run.id < currentId && kyivDay(run.created_at) === today);
+            if (earlier) console.log(`Nightly build for ${today} already ran as #${earlier.run_number}; skipping.`);
+            return !earlier;
+          };
+          if (NIGHTLY.includes(process.env.EVENT)) {
+            // A failed lookup must not cost the nightly build: build anyway.
+            const first = await firstNightlyRunToday().catch((error) => {
+              console.log(`::warning::Nightly run lookup failed (${error.message}); building anyway.`);
+              return true;
+            });
+            if (!first) {
+              output('run=false');
+              process.exit(0);
+            }
+          }
+          const target = process.env.TARGET;
+          const entries = [
+            { target: 'android-apk', artifact: 'android-apk', runner: 'ubuntu-24.04', java: true,  rust: true,  rust_targets: 'aarch64-linux-android,x86_64-linux-android' },
+            { target: 'ios-app', artifact: 'ios-app', runner: 'macos-15', java: false, rust: true,  rust_targets: 'aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios' },
+            { target: 'mac-dmg', artifact: 'mac-dmg-arm64', runner: 'macos-15', remote_arch: 'arm64', java: false, rust: true, rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin' },
+            { target: 'mac-dmg', artifact: 'mac-dmg-x64', runner: 'macos-15-intel', remote_arch: 'x64', java: false, rust: true, rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin' },
+            { target: 'windows-exe', artifact: 'windows-exe', runner: 'windows-2025', java: false, rust: false, rust_targets: '' },
+            { target: 'linux-appimage', artifact: 'linux-appimage', runner: 'ubuntu-24.04', java: false, rust: true, rust_targets: '' },
+            { target: 'npm-packages', artifact: 'npm-packages', runner: 'ubuntu-24.04', java: false, rust: false, rust_targets: '' },
+          ];
+          const arch = process.env.ARCH || 'all';
+          let selected = target === 'all' ? entries : entries.filter((entry) => entry.target === target);
+          // Only multi-arch targets carry remote_arch; leave the others alone.
+          if (arch !== 'all') selected = selected.filter((entry) => !entry.remote_arch || entry.remote_arch === arch);
+          if (selected.length === 0) process.exit(2);
+          output('run=true');
+          output(`matrix=${JSON.stringify({ include: selected })}`);
+          // Only a full build carries every desktop platform the update feed needs,
+          // and an arch-filtered run is missing half the macOS pair.
+          output(`publish=${target === 'all' && arch === 'all'}`);
+          NODE
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.14.0
+
+      - uses: actions/setup-java@v5
+        if: matrix.java
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+        if: matrix.rust && matrix.rust_targets == ''
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+        if: matrix.rust && matrix.rust_targets != ''
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Select pinned Xcode
+        if: matrix.target == 'ios-app'
+        shell: bash
+        env:
+          WANT: ${{ vars.POLYTH_IOS_XCODE_VERSION || '26.6' }}
+          # `secrets` is unavailable in a step `if`, but it is allowed here.
+          SIGNING: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID != '' }}
+        run: |
+          set -euo pipefail
+          # remote-build.mjs refuses to sign under an unexpected toolchain. The
+          # unsigned simulator build does not care, so a missing pin must not
+          # break it: fail only when this run is actually going to sign.
+          app="/Applications/Xcode_${WANT}.app"
+          if [ -d "$app" ]; then
+            sudo xcode-select -s "$app/Contents/Developer"
+          elif [ "$SIGNING" = "true" ]; then
+            echo "Xcode $WANT is required to sign, and is not on this runner. Available:" >&2
+            ls -d /Applications/Xcode*.app 2>/dev/null >&2 || echo "  (none)" >&2
+            echo "Set the POLYTH_IOS_XCODE_VERSION repository variable to one of them." >&2
+            exit 1
+          else
+            echo "::warning::Xcode $WANT absent; unsigned build continues on the runner default."
+          fi
+          xcodebuild -version
+
+      - name: Install iOS signing tools
+        if: matrix.target == 'ios-app'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # codemagic-cli-tools provides keychain / app-store-connect /
+          # xcode-project, the commands the old codemagic.yaml relied on.
+          # A venv sidesteps the runner's externally-managed Python.
+          python3 -m venv "$RUNNER_TEMP/cmtools"
+          "$RUNNER_TEMP/cmtools/bin/pip" install --quiet --upgrade codemagic-cli-tools
+          echo "$RUNNER_TEMP/cmtools/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare source
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event_name == 'repository_dispatch' && github.event.client_payload.ref || 'master' }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REPOSITORY"
+          test -n "$SOURCE_DEPLOY_KEY"
+          test -n "$SOURCE_REF"
+
+          KEY_FILE="$PWD/.source-key"
+          KNOWN_HOSTS="$PWD/.known-hosts"
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          ssh-keyscan -t ed25519 github.com > "$KNOWN_HOSTS" 2>/dev/null
+
+          rm -rf source
+          git init -q source
+          git -C source remote add origin "git@github.com:${SOURCE_REPOSITORY}.git"
+          if ! GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"             git -C source fetch -q --depth=1 origin "$SOURCE_REF" >/dev/null 2>&1; then
+            rm -f "$KEY_FILE" "$KNOWN_HOSTS"
+            echo "Source checkout failed"
+            exit 1
+          fi
+          git -C source checkout -q --detach FETCH_HEAD >/dev/null 2>&1
+          git -C source remote remove origin
+          rm -f "$KEY_FILE" "$KNOWN_HOSTS"
+
+      - name: Execute
+        id: execute
+        shell: bash
+        env:
+          REMOTE_BUILD_TARGET: ${{ matrix.target }}
+          REMOTE_BUILD_ARCH: ${{ matrix.remote_arch || '' }}
+          REMOTE_BUILD_OUTPUT: ${{ runner.temp }}/build-output
+          POLYTH_UPDATE_REPOSITORY: ${{ github.repository }}
+          POLYTH_BUILD_NUMBER: ${{ github.run_number }}
+          # Developer ID signing + notarization. Scoped to the macOS jobs so the
+          # signing key never reaches the Windows/Linux/Android runners.
+          # remote-build.mjs falls back to ad-hoc signing when these are unset.
+          CSC_LINK: ${{ matrix.target == 'mac-dmg' && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.target == 'mac-dmg' && secrets.CSC_KEY_PASSWORD || '' }}
+          APPLE_ID: ${{ matrix.target == 'mac-dmg' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.target == 'mac-dmg' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.target == 'mac-dmg' && secrets.APPLE_TEAM_ID || '' }}
+          # Signed iOS archive. Scoped to the iOS job so the App Store Connect
+          # key never reaches another runner. remote-build.mjs falls back to an
+          # unsigned simulator build when these are unset.
+          APP_STORE_CONNECT_ISSUER_ID: ${{ matrix.target == 'ios-app' && secrets.APP_STORE_CONNECT_ISSUER_ID || '' }}
+          APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ matrix.target == 'ios-app' && secrets.APP_STORE_CONNECT_KEY_IDENTIFIER || '' }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ matrix.target == 'ios-app' && secrets.APP_STORE_CONNECT_PRIVATE_KEY || '' }}
+          CERTIFICATE_PRIVATE_KEY: ${{ matrix.target == 'ios-app' && secrets.CERTIFICATE_PRIVATE_KEY || '' }}
+          APP_STORE_APPLE_ID: ${{ matrix.target == 'ios-app' && secrets.APP_STORE_APPLE_ID || '' }}
+          POLYTH_IOS_XCODE_VERSION: ${{ vars.POLYTH_IOS_XCODE_VERSION || '26.6' }}
+        run: |
+          set +e
+          cd source
+          # Stream as well as capture. A silent redirect tells you nothing when a
+          # step hangs, and a job timeout kills this step before the failure tail
+          # below ever prints. PIPESTATUS keeps node's exit code, not tee's.
+          node scripts/ci/remote-build.mjs 2>&1 | tee "$RUNNER_TEMP/build.log"
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -ne 0 ]; then
+            echo "::group::Remote builder failure tail"
+            tail -n 120 "$RUNNER_TEMP/build.log"
+            echo "::endgroup::"
+          else
+            echo "::group::Remote builder output manifest"
+            sed -n '/^remote-build outputs/,/^remote-build: /p' "$RUNNER_TEMP/build.log"
+            echo "::endgroup::"
+          fi
+          exit 0
+
+      - name: Upload product outputs
+        id: products
+        if: steps.execute.outputs.code == '0'
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: products-${{ matrix.artifact }}
+          retention-days: 3
+          path: ${{ runner.temp }}/build-output
+          if-no-files-found: error
+
+      - name: Report failure
+        if: always() && (steps.execute.outputs.code != '0' || steps.products.outcome == 'failure')
+        shell: bash
+        run: |
+          echo "Build failed. Inspect the step logs."
+          exit 1
+
+  # Desktop auto-update feed: one GitHub Release per full build, holding the
+  # installers and electron-updater metadata (scripts/ci/update-feed.mjs).
+  # Runs even when a non-desktop target failed; the assemble step refuses an
+  # incomplete desktop set, so clients never see a partial release.
+  publish:
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.14.0
+
+      - name: Prepare source
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event_name == 'repository_dispatch' && github.event.client_payload.ref || 'master' }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REPOSITORY"
+          test -n "$SOURCE_DEPLOY_KEY"
+          test -n "$SOURCE_REF"
+
+          KEY_FILE="$PWD/.source-key"
+          KNOWN_HOSTS="$PWD/.known-hosts"
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          ssh-keyscan -t ed25519 github.com > "$KNOWN_HOSTS" 2>/dev/null
+
+          rm -rf source
+          git init -q source
+          git -C source remote add origin "git@github.com:${SOURCE_REPOSITORY}.git"
+          if ! GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"             git -C source fetch -q --depth=1 origin "$SOURCE_REF" >/dev/null 2>&1; then
+            rm -f "$KEY_FILE" "$KNOWN_HOSTS"
+            echo "Source checkout failed"
+            exit 1
+          fi
+          git -C source checkout -q --detach FETCH_HEAD >/dev/null 2>&1
+          git -C source remote remove origin
+          rm -f "$KEY_FILE" "$KNOWN_HOSTS"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: products-*
+          path: ${{ runner.temp }}/products
+
+      - name: Assemble feed
+        id: feed
+        run: node source/scripts/ci/update-feed.mjs assemble "$RUNNER_TEMP/products" "$RUNNER_TEMP/feed"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.feed.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          tag="v$VERSION"
+          draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          if [ "$draft" = "false" ]; then
+            echo "Release $tag is already public; leaving it untouched."
+            exit 0
+          fi
+          if [ "$draft" = "missing" ]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes "" --draft
+          fi
+          # Upload into a draft, then publish: the updater never sees a half-uploaded release.
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP"/feed/*
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' |
+          while IFS= read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done
