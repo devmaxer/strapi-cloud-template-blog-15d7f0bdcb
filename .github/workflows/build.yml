@@ -1,0 +1,184 @@
+name: Build
+run-name: Build ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - android-apk
+          - ios-app
+          - mac-dmg
+          - windows-exe
+          - linux-appimage
+          - npm-packages
+      ref:
+        description: Source ref
+        required: true
+        type: string
+        default: master
+  repository_dispatch:
+    types: [build]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        name: Plan
+        shell: bash
+        env:
+          TARGET: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.target || inputs.target }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const target = process.env.TARGET;
+          const entries = [
+            { target: 'android-apk', runner: 'ubuntu-24.04', java: true,  rust: true,  rust_targets: 'aarch64-linux-android,x86_64-linux-android' },
+            { target: 'ios-app', runner: 'macos-15', java: false, rust: true,  rust_targets: 'aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios' },
+            { target: 'mac-dmg', runner: 'macos-15', java: false, rust: true, rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin' },
+            { target: 'windows-exe', runner: 'windows-2025', java: false, rust: false, rust_targets: '' },
+            { target: 'linux-appimage', runner: 'ubuntu-24.04', java: false, rust: true, rust_targets: '' },
+            { target: 'npm-packages', runner: 'ubuntu-24.04', java: false, rust: false, rust_targets: '' },
+          ];
+          const selected = target === 'all' ? entries : entries.filter((entry) => entry.target === target);
+          if (selected.length === 0) process.exit(2);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include: selected })}\n`);
+          NODE
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+
+      - uses: actions/setup-java@v4
+        if: matrix.java
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+        if: matrix.rust && matrix.rust_targets == ''
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+        if: matrix.rust && matrix.rust_targets != ''
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Prepare source
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          SOURCE_REF: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.ref || inputs.ref }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REPOSITORY"
+          test -n "$SOURCE_DEPLOY_KEY"
+          test -n "$SOURCE_REF"
+
+          KEY_FILE="$PWD/.source-key"
+          KNOWN_HOSTS="$PWD/.known-hosts"
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          ssh-keyscan -t ed25519 github.com > "$KNOWN_HOSTS" 2>/dev/null
+
+          rm -rf source
+          git init -q source
+          git -C source remote add origin "git@github.com:${SOURCE_REPOSITORY}.git"
+          if ! GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"             git -C source fetch -q --depth=1 origin "$SOURCE_REF" >/dev/null 2>&1; then
+            rm -f "$KEY_FILE" "$KNOWN_HOSTS"
+            echo "Source checkout failed"
+            exit 1
+          fi
+          git -C source checkout -q --detach FETCH_HEAD >/dev/null 2>&1
+          git -C source remote remove origin
+          rm -f "$KEY_FILE" "$KNOWN_HOSTS"
+
+      - name: Execute
+        id: execute
+        shell: bash
+        env:
+          REMOTE_BUILD_TARGET: ${{ matrix.target }}
+          REMOTE_BUILD_OUTPUT: ${{ runner.temp }}/build-output
+        run: |
+          set +e
+          cd source
+          node scripts/ci/remote-build.mjs > "$RUNNER_TEMP/build.log" 2>&1
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Seal result
+        shell: bash
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$ARTIFACT_KEY"
+          bundle="$RUNNER_TEMP/secure-bundle"
+          plain="$RUNNER_TEMP/bundle.tgz"
+          sealed="$RUNNER_TEMP/bundle.bin"
+          rm -rf "$bundle" "$plain" "$sealed"
+          mkdir -p "$bundle"
+          cp "$RUNNER_TEMP/build.log" "$bundle/build.log"
+          if [ -d "$RUNNER_TEMP/build-output" ]; then
+            cp -R "$RUNNER_TEMP/build-output" "$bundle/output"
+          fi
+          # Stream the archive through stdout instead of passing a path to
+          # `tar -f`: GNU tar parses a Windows drive letter (`D:\a\_temp\...`)
+          # as a remote `host:path` archive and fails with
+          # "Cannot connect to D: resolve failed". `--force-local` is GNU-only,
+          # so keep the invocation portable instead.
+          tar -czf - -C "$bundle" . > "$plain"
+          node - "$plain" "$sealed" <<'NODE'
+          const { createCipheriv, randomBytes, scryptSync } = require('node:crypto');
+          const { readFileSync, writeFileSync } = require('node:fs');
+          const input = process.argv[2];
+          const output = process.argv[3];
+          const password = process.env.ARTIFACT_KEY;
+          const salt = randomBytes(16);
+          const iv = randomBytes(12);
+          const key = scryptSync(password, salt, 32);
+          const cipher = createCipheriv('aes-256-gcm', key, iv);
+          const encrypted = Buffer.concat([cipher.update(readFileSync(input)), cipher.final()]);
+          const tag = cipher.getAuthTag();
+          writeFileSync(output, Buffer.concat([Buffer.from('RB01'), salt, iv, tag, encrypted]));
+          NODE
+          rm -rf "$bundle" "$plain" "$RUNNER_TEMP/build-output" "$RUNNER_TEMP/build.log" source
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ github.run_id }}-${{ matrix.target }}
+          retention-days: 3
+          path: ${{ runner.temp }}/bundle.bin
+          if-no-files-found: error
+
+      - name: Report failure
+        if: steps.execute.outputs.code != '0'
+        shell: bash
+        run: |
+          echo "Build failed. Inspect the encrypted bundle."
+          exit 1
